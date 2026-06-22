@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <title>登录测试页 · Easy Password</title>
+    <style>
+      body { font-family: "Microsoft YaHei", sans-serif; background: #f6f8fa; display: flex; justify-content: center; padding-top: 60px; }
+      .card { background: #fff; padding: 28px; border-radius: 12px; box-shadow: 0 8px 30px rgba(0,0,0,.08); width: 320px; }
+      h2 { margin: 0 0 18px; }
+      label { display: block; font-size: 13px; color: #555; margin: 12px 0 4px; }
+      input { width: 100%; padding: 9px 10px; border: 1px solid #d0d7de; border-radius: 7px; box-sizing: border-box; }
+      button { width: 100%; margin-top: 18px; padding: 10px; border: none; border-radius: 7px; background: #4f46e5; color: #fff; font-size: 14px; cursor: pointer; }
+    </style>
+  </head>
+  <body>
+    <form class="card" onsubmit="event.preventDefault(); alert('已登录（演示）');">
+      <h2>登录</h2>
+      <label>账号</label>
+      <input name="username" type="text" autocomplete="username" placeholder="账号（可输入：张三）" />
+      <label>密码</label>
+      <input name="password" type="password" autocomplete="current-password" placeholder="密码" />
+      <button type="submit">登录</button>
+    </form>
+  </body>
+</html>
