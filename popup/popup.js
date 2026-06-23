@@ -59,6 +59,22 @@ async function refreshPermBar() {
   $("permBar").hidden = granted || $("viewMain").hidden;
 }
 
+// 待保存确认条：图标角标点开后，在弹窗里确认是否保存（系统通知的备选/补充）。
+let pendingNotify = null;
+async function refreshSaveBar() {
+  const r = await send("GET_NOTIFY");
+  pendingNotify = r && r.ok ? r.notify : null;
+  const bar = $("saveBar");
+  if (pendingNotify) {
+    $("saveBarText").textContent = pendingNotify.password
+      ? i18n("banner_save_msg", [pendingNotify.username])
+      : i18n("banner_save_account_msg", [pendingNotify.username]);
+    bar.hidden = false;
+  } else {
+    bar.hidden = true;
+  }
+}
+
 // 申请网站访问权限（须由用户手势调用）。返回是否授权成功，UI 由调用方刷新。
 async function requestHostAccess() {
   try {
@@ -150,6 +166,7 @@ async function refresh() {
     startTimer(st.expiresAt);
     await loadList();
     refreshPermBar(); // 主界面：未授权时显示顶部授权条
+    refreshSaveBar(); // 有待保存凭据时显示确认条
     // 每周备份提醒：本周未备份且库里有内容时弹出（导出成功才会消除）。
     if (allEntries.length > 0 && isBackupDue(st.settings)) $("backupModal").hidden = false;
   }
@@ -317,10 +334,11 @@ function renderList() {
   list.innerHTML = "";
   let entries = allEntries.filter(
     (e) =>
-      e.username.toLowerCase().includes(q) ||
-      e.domain.toLowerCase().includes(q) ||
-      (e.note || "").toLowerCase().includes(q) ||
-      (e.group || "").toLowerCase().includes(q)
+      !e.bastion && // 堡垒机目标机凭据不在密码库列表显示，只在「堡垒机」Tab 出现
+      (e.username.toLowerCase().includes(q) ||
+        e.domain.toLowerCase().includes(q) ||
+        (e.note || "").toLowerCase().includes(q) ||
+        (e.group || "").toLowerCase().includes(q))
   );
   // 侧边栏：当前站点的条目排到最前，密码送到手边。
   if (currentHost) {
@@ -742,6 +760,357 @@ async function doImport(backup, password) {
   }
 }
 
+// ---------- 堡垒机记录器 ----------
+
+let bastions = [];
+
+// 从堡垒机连接 URL 解析「目标机 IP + 用户」。
+// 例：.../#/client/guanbo@172.17.51.108:3389 - RDP - administrator/MTEA...
+function parseBastionTarget(rawUrl) {
+  let s = rawUrl || "";
+  try {
+    s = decodeURIComponent(s);
+  } catch {
+    /* keep raw */
+  }
+  const ipm = s.match(/@(\d{1,3}(?:\.\d{1,3}){3})/) || s.match(/(\d{1,3}(?:\.\d{1,3}){3})/);
+  const host = ipm ? ipm[1] : "";
+  let username = "";
+  const um = s.match(/-\s*[A-Za-z0-9]+\s*-\s*([^/?#]+)/); // "... - RDP - administrator"
+  if (um) username = um[1].trim();
+  return host ? { host, username } : null;
+}
+
+async function getActiveTabUrl() {
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    return (tab && tab.url) || "";
+  } catch {
+    return "";
+  }
+}
+
+function showTab(which) {
+  const bastion = which === "bastion";
+  $("tabVault").classList.toggle("active", !bastion);
+  $("tabBastion").classList.toggle("active", bastion);
+  $("vaultPanel").hidden = bastion;
+  $("bastionPanel").hidden = !bastion;
+  if (bastion) renderBastion();
+}
+
+function renderBastionHosts() {
+  const box = $("bastionList");
+  box.innerHTML = "";
+  for (const h of bastions) {
+    const chip = document.createElement("span");
+    chip.className = "override-chip";
+    const name = document.createElement("span");
+    name.textContent = h;
+    const rm = document.createElement("button");
+    rm.className = "override-rm";
+    rm.textContent = "✕";
+    rm.addEventListener("click", () => removeBastion(h));
+    chip.appendChild(name);
+    chip.appendChild(rm);
+    box.appendChild(chip);
+  }
+}
+
+async function saveBastions(next) {
+  bastions = next;
+  await send("SET_BASTIONS", { bastions });
+  renderBastionHosts();
+}
+function addBastion(h) {
+  h = (h || "").trim().toLowerCase();
+  if (!h || bastions.includes(h)) return;
+  saveBastions([...bastions, h]).then(() => {
+    toast(i18n("toast_bastion_added"));
+    renderBastion();
+  });
+}
+function removeBastion(h) {
+  saveBastions(bastions.filter((x) => x !== h)).then(renderBastion);
+}
+
+let bastionGen = 0; // 渲染代次：并发重入时只让最新一次落地，避免重复两条
+
+// 构建一条堡垒机条目行（堡垒机匹配页面和非堡垒机页面共用）。
+// e: 必有 id, username；可选 hasPassword；非堡垒机页面传入 domain。
+function buildBastionEntryRow(e) {
+  const row = document.createElement("div");
+  row.className = "entry";
+
+  const main = document.createElement("div");
+  main.className = "entry-main";
+  const u = document.createElement("div");
+  u.className = "entry-user";
+  u.textContent = e.username;
+  main.appendChild(u);
+  if (e.domain) {
+    const d = document.createElement("div");
+    d.className = "entry-domain";
+    d.textContent = e.domain;
+    main.appendChild(d);
+  }
+  const pass = document.createElement("div");
+  pass.className = "entry-pass";
+  main.appendChild(pass);
+
+  const act = document.createElement("div");
+  act.className = "entry-actions";
+
+  // 显示/隐藏密码
+  const showBtn = document.createElement("button");
+  showBtn.className = "mini";
+  showBtn.textContent = i18n("btn_show");
+  showBtn.addEventListener("click", async () => {
+    if (pass.classList.contains("show")) {
+      pass.classList.remove("show");
+      showBtn.textContent = i18n("btn_show");
+      return;
+    }
+    const r = await send("REVEAL_PASSWORD", { id: e.id });
+    if (r && r.ok) {
+      pass.textContent = r.password;
+      pass.classList.add("show");
+      showBtn.textContent = i18n("btn_hide");
+    } else {
+      toast(r?.error || i18n("err_decrypt_fail"));
+    }
+  });
+
+  const cu = document.createElement("button");
+  cu.className = "mini";
+  cu.textContent = i18n("btn_copy_user");
+  cu.addEventListener("click", () => copyText(e.username, "toast_user_copied"));
+  const cp = document.createElement("button");
+  cp.className = "mini";
+  cp.textContent = i18n("btn_copy_pwd");
+  cp.addEventListener("click", async () => {
+    const r = await send("REVEAL_PASSWORD", { id: e.id });
+    if (r && r.ok) copyText(r.password, "toast_copied");
+    else toast(r?.error || i18n("err_decrypt_fail"));
+  });
+
+  // 改密码：原地切换为输入框
+  const editBtn = document.createElement("button");
+  editBtn.className = "mini";
+  editBtn.textContent = i18n("btn_edit_pwd");
+  const cancelEdit = () => {
+    // 还原为只读密码区域（main.lastChild 是编辑模式下的 pwInput）
+    main.removeChild(main.lastChild);
+    main.appendChild(pass);
+    act.innerHTML = "";
+    act.appendChild(showBtn);
+    act.appendChild(cu);
+    act.appendChild(cp);
+    act.appendChild(editBtn);
+    act.appendChild(delBtn);
+    pass.classList.remove("show");
+    pass.textContent = "";
+    showBtn.textContent = i18n("btn_show");
+  };
+  const doSavePassword = async (pwInput) => {
+    const password = pwInput.value;
+    const r = await send("UPDATE_ENTRY", { id: e.id, password });
+    if (r && r.ok) {
+      toast(password ? i18n("toast_saved") : i18n("toast_updated"));
+      // 更新内存中的标记
+      const ae = allEntries.find((x) => x.id === e.id);
+      if (ae) { ae.hasPassword = !!password; }
+      cancelEdit();
+    } else {
+      toast(r?.error || i18n("err_save_fail"));
+    }
+  };
+  editBtn.addEventListener("click", () => {
+    // 移除密码区，替换为输入框 + 保存/取消
+    if (main.contains(pass)) main.removeChild(pass);
+    const pwInput = document.createElement("input");
+    pwInput.type = "password";
+    pwInput.className = "bastion-input";
+    pwInput.placeholder = i18n("ph_bastion_pwd");
+    pwInput.style.margin = "0";
+    const saveBtn = document.createElement("button");
+    saveBtn.className = "mini";
+    saveBtn.textContent = i18n("btn_save");
+    saveBtn.addEventListener("click", () => doSavePassword(pwInput));
+    const cancelBtn = document.createElement("button");
+    cancelBtn.className = "mini";
+    cancelBtn.textContent = i18n("cancel_btn");
+    cancelBtn.addEventListener("click", cancelEdit);
+    pwInput.addEventListener("keydown", (ev) => ev.key === "Enter" && doSavePassword(pwInput));
+    main.appendChild(pwInput);
+    act.innerHTML = "";
+    act.appendChild(saveBtn);
+    act.appendChild(cancelBtn);
+    pwInput.focus();
+  });
+
+  const delBtn = document.createElement("button");
+  delBtn.className = "mini danger";
+  delBtn.textContent = i18n("btn_delete");
+  delBtn.addEventListener("click", async () => {
+    await send("DELETE_ENTRY", { id: e.id });
+    toast(i18n("toast_deleted"));
+    // 刷新堡垒机视图（重新拉取列表再渲染）
+    await loadList();
+    renderBastion();
+  });
+
+  act.appendChild(showBtn);
+  act.appendChild(cu);
+  act.appendChild(cp);
+  act.appendChild(editBtn);
+  act.appendChild(delBtn);
+  row.appendChild(main);
+  row.appendChild(act);
+  return row;
+}
+
+async function renderBastion() {
+  const gen = ++bastionGen;
+  const br = await send("GET_BASTIONS");
+  if (gen !== bastionGen) return;
+  bastions = br && br.ok ? br.bastions || [] : [];
+
+  const url = await getActiveTabUrl();
+  if (gen !== bastionGen) return;
+  let host = "";
+  let hostname = "";
+  try {
+    const u = new URL(url);
+    host = u.host;
+    hostname = u.hostname;
+  } catch {
+    /* not a normal URL */
+  }
+  const isBastion = host && bastions.some((b) => b === host || b === hostname);
+  const target = isBastion ? parseBastionTarget(url) : null;
+
+  // 仅在确实是堡垒机目标页时才查账号
+  let list = [];
+  if (target) {
+    const res = await send("GET_SUGGESTIONS", { domain: target.host, prefix: "" });
+    if (gen !== bastionGen) return;
+    list = Array.isArray(res) ? res : [];
+  }
+
+  // —— 以下全是同步 DOM 操作，不再有 await，杜绝并发重入重复 ——
+  renderBastionHosts();
+  const ctx = $("bastionContext");
+  ctx.innerHTML = "";
+
+  if (!isBastion) {
+    // 非堡垒机页面：显示所有堡垒机条目
+    $("bastionSetCurrent").hidden = !hostname;
+    $("bastionSetCurrent").onclick = () => addBastion(hostname);
+
+    const bastionEntries = allEntries.filter((e) => e.bastion);
+    if (bastionEntries.length) {
+      const label = document.createElement("div");
+      label.className = "bastion-label";
+      label.textContent = i18n("bastion_all");
+      ctx.appendChild(label);
+      for (const e of bastionEntries) {
+        const row = buildBastionEntryRow({ id: e.id, username: e.username, domain: e.domain, hasPassword: e.hasPassword });
+        ctx.appendChild(row);
+      }
+    } else {
+      const p = document.createElement("div");
+      p.className = "bastion-hint";
+      p.textContent = i18n("bastion_not_here");
+      ctx.appendChild(p);
+    }
+    return;
+  }
+  $("bastionSetCurrent").hidden = true;
+
+  if (!target) {
+    ctx.textContent = i18n("bastion_not_here");
+    return;
+  }
+
+  // 头部：目标机 + 用户 + 红绿灯（对目标机 IP 设置环境标记）
+  const head = document.createElement("div");
+  head.className = "bastion-head";
+  const info = document.createElement("div");
+  info.className = "bastion-info";
+  const t1 = document.createElement("div");
+  t1.className = "bastion-target";
+  t1.textContent = i18n("bastion_target") + "：" + target.host;
+  const t2 = document.createElement("div");
+  t2.className = "bastion-sub";
+  t2.textContent = i18n("bastion_user") + "：" + (target.username || "—");
+  info.appendChild(t1);
+  info.appendChild(t2);
+  const dots = document.createElement("span");
+  dots.className = "group-colors";
+  const cur = overrides[target.host] || "none";
+  for (const c of ["none", "red", "green"]) {
+    const dot = document.createElement("button");
+    dot.className = "color-dot c-" + c + (cur === c ? " active" : "");
+    dot.title = i18n("title_color_" + c);
+    dot.addEventListener("click", async () => {
+      await setOverride(target.host, c);
+      renderBastion();
+    });
+    dots.appendChild(dot);
+  }
+  head.appendChild(info);
+  head.appendChild(dots);
+  ctx.appendChild(head);
+
+  // 该目标机已存的账号（list 已在上面查好）
+  if (list.length) {
+    const label = document.createElement("div");
+    label.className = "bastion-label";
+    label.textContent = i18n("bastion_matched");
+    ctx.appendChild(label);
+    for (const e of list) {
+      ctx.appendChild(buildBastionEntryRow({ id: e.id, username: e.username }));
+    }
+  } else {
+    // 未匹配：预填好目标机与用户，你只补密码即可保存
+    const note = document.createElement("div");
+    note.className = "bastion-label";
+    note.textContent = i18n("bastion_no_match");
+    ctx.appendChild(note);
+    const userInput = document.createElement("input");
+    userInput.type = "text";
+    userInput.className = "bastion-input";
+    userInput.value = target.username || "";
+    userInput.placeholder = i18n("ph_username");
+    const pwInput = document.createElement("input");
+    pwInput.type = "password";
+    pwInput.className = "bastion-input";
+    pwInput.placeholder = i18n("ph_bastion_pwd");
+    const saveBtn = document.createElement("button");
+    saveBtn.className = "btn primary";
+    saveBtn.textContent = i18n("add_btn");
+    const doSave = async () => {
+      const username = userInput.value.trim();
+      if (!username) return toast(i18n("err_fill_domain_user"));
+      const r = await send("SAVE_CREDENTIAL", { domain: target.host, username, password: pwInput.value, bastion: true });
+      if (r && r.ok) {
+        toast(r.savedPassword ? i18n("toast_saved") : i18n("toast_account_remembered"));
+        // 刷新后重新渲染
+        await loadList();
+        renderBastion();
+      } else {
+        toast(r?.error || i18n("err_save_fail"));
+      }
+    };
+    saveBtn.addEventListener("click", doSave);
+    pwInput.addEventListener("keydown", (ev) => ev.key === "Enter" && doSave());
+    ctx.appendChild(userInput);
+    ctx.appendChild(pwInput);
+    ctx.appendChild(saveBtn);
+  }
+}
+
 // ---------- 初始化 ----------
 
 function init() {
@@ -827,6 +1196,32 @@ function init() {
   // 一键清除并禁用浏览器自带密码
   $("clearBrowserPM").addEventListener("click", handleDisableBrowserPM);
 
+  // 待保存确认条
+  $("saveBarSave").addEventListener("click", async () => {
+    if (!pendingNotify) return;
+    const p = pendingNotify;
+    const r = await send("SAVE_CREDENTIAL", { domain: p.domain, username: p.username, password: p.password, fullUrl: p.fullUrl });
+    await send("CLEAR_NOTIFY");
+    $("saveBar").hidden = true;
+    pendingNotify = null;
+    if (r && r.ok) toast(r.savedPassword ? i18n("toast_saved") : i18n("toast_account_remembered"));
+    loadList();
+  });
+  $("saveBarIgnore").addEventListener("click", async () => {
+    await send("CLEAR_NOTIFY");
+    $("saveBar").hidden = true;
+    pendingNotify = null;
+  });
+
+  // 堡垒机 Tab
+  $("tabVault").addEventListener("click", () => showTab("vault"));
+  $("tabBastion").addEventListener("click", () => showTab("bastion"));
+  $("bastionAddBtn").addEventListener("click", () => {
+    addBastion($("bastionHostInput").value);
+    $("bastionHostInput").value = "";
+  });
+  $("bastionHostInput").addEventListener("keydown", (e) => e.key === "Enter" && $("bastionAddBtn").click());
+
   // 模块二：📌 打开侧边栏常驻
   $("pinBtn").addEventListener("click", openSidePanel);
   if (IS_PANEL) setupPanel();
@@ -834,8 +1229,8 @@ function init() {
   // 第 1 条：库变化时实时刷新（弹窗新增 ↔ 侧边栏同步）。
   try {
     chrome.storage.onChanged.addListener((ch, area) => {
-      if (area !== "local") return;
-      if ((ch.ep_entries || ch.ep_groups || ch.ep_overrides) && !$("viewMain").hidden) loadList();
+      if (area === "local" && (ch.ep_entries || ch.ep_groups || ch.ep_overrides) && !$("viewMain").hidden) loadList();
+      if (area === "session" && ch.ep_notify && !$("viewMain").hidden) refreshSaveBar();
     });
   } catch {
     /* ignore */
@@ -856,11 +1251,16 @@ async function openSidePanel() {
 }
 
 // 侧边栏常驻：随标签切换/导航实时刷新当前站点与列表。
+let panelRefreshTimer = null;
+function panelRefresh() {
+  clearTimeout(panelRefreshTimer);
+  panelRefreshTimer = setTimeout(updateCurrentSite, 150); // 去抖：onUpdated 会密集触发
+}
 function setupPanel() {
   document.body.classList.add("is-panel");
-  chrome.tabs.onActivated.addListener(updateCurrentSite);
+  chrome.tabs.onActivated.addListener(panelRefresh);
   chrome.tabs.onUpdated.addListener((_id, info) => {
-    if (info.url || info.status === "complete") updateCurrentSite();
+    if (info.url || info.status === "complete") panelRefresh();
   });
   updateCurrentSite();
 }
@@ -879,6 +1279,7 @@ async function updateCurrentSite() {
     ps.hidden = true;
   }
   if (!$("viewMain").hidden) renderList();
+  if (!$("bastionPanel").hidden) renderBastion(); // 侧边栏切到堡垒机连接页时刷新
 }
 
 document.addEventListener("DOMContentLoaded", init);

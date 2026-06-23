@@ -63,29 +63,52 @@
     const re = new RegExp("^" + pattern.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*") + "$", "i");
     return re.test(target);
   }
-  function colorFor(env) {
-    if (env[HOST]) return env[HOST]; // 精确（含端口）优先
-    if (env[HOSTNAME]) return env[HOSTNAME];
+  // 对给定 host（含/不含端口）求颜色。
+  function colorForHost(env, host, hostname) {
+    if (env[host]) return env[host];
+    if (env[hostname]) return env[hostname];
     for (const p of Object.keys(env)) {
-      if (matchKey(p, p.indexOf(":") >= 0 ? HOST : HOSTNAME)) return env[p];
+      if (matchKey(p, p.indexOf(":") >= 0 ? host : hostname)) return env[p];
     }
     return null;
   }
 
+  // 从堡垒机连接 URL 里解析目标机 IP（如 ...@172.17.51.108:3389 - RDP - administrator）。
+  function bastionTargetHost() {
+    let s = location.href;
+    try {
+      s = decodeURIComponent(s);
+    } catch {
+      /* keep raw */
+    }
+    const m = s.match(/@(\d{1,3}(?:\.\d{1,3}){3})/) || s.match(/(\d{1,3}(?:\.\d{1,3}){3})/);
+    return m ? m[1] : "";
+  }
+
   async function refresh() {
     try {
-      const d = await chrome.storage.local.get("ep_env");
-      apply(colorFor(d.ep_env || {}));
+      const d = await chrome.storage.local.get(["ep_env", "ep_bastions"]);
+      const env = d.ep_env || {};
+      const bastions = d.ep_bastions || [];
+      // 若当前页是堡垒机：按 URL 里的「目标机 IP」上色（你 RDP 进了哪台，就显示那台的红绿）。
+      if (bastions.some((b) => b === HOST || b === HOSTNAME)) {
+        const t = bastionTargetHost();
+        apply(t ? colorForHost(env, t, t) : null);
+      } else {
+        apply(colorForHost(env, HOST, HOSTNAME));
+      }
     } catch {
       /* 扩展上下文失效时忽略 */
     }
   }
 
   refresh();
+  // 堡垒机是 SPA，切换连接只改 hash → 监听 hashchange 重新判定目标机。
+  window.addEventListener("hashchange", refresh);
   // 颜色变更（解除/切换）实时反映，无需刷新页面。
   try {
     chrome.storage.onChanged.addListener((ch, area) => {
-      if (area === "local" && ch.ep_env) refresh();
+      if (area === "local" && (ch.ep_env || ch.ep_bastions)) refresh();
     });
   } catch {
     /* ignore */

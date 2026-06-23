@@ -33,6 +33,7 @@ const STORAGE = {
   GROUPS: "ep_groups", // {组名: "none"|"red"|"green"}（明文标签，非密钥）
   ENV: "ep_env", // {host:端口: "red"|"green"}（最终生效色，供环境警告内容脚本读取）
   OVERRIDES: "ep_overrides", // {host:端口: "red"|"green"}（按站点覆盖，优先级高于分组）
+  BASTIONS: "ep_bastions", // ["10.5.65.70", ...] 堡垒机地址（明文列表）
 };
 const SESSION = "ep_session";
 const PENDING = "ep_pending"; // 跨导航待保存凭据（内存、短时效）
@@ -318,7 +319,7 @@ async function entryDomainToken(e, hmacKey) {
   return null;
 }
 
-async function saveCredential({ domain, username, password, note, fullUrl, group }, { privateKey, hmacKey }) {
+async function saveCredential({ domain, username, password, note, fullUrl, group, bastion }, { privateKey, hmacKey }) {
   domain = normalizeDomain(domain);
   username = (username || "").trim();
   password = password || "";
@@ -356,12 +357,14 @@ async function saveCredential({ domain, username, password, note, fullUrl, group
     if (note !== undefined) entries[matched].encNote = encNote;
     if (fullUrl !== undefined) entries[matched].encFullUrl = encFullUrl;
     if (group !== undefined) entries[matched].encGroup = encGroup;
+    if (bastion !== undefined) entries[matched].bastion = !!bastion;
     entries[matched].updatedAt = now;
   } else {
     entries.push({
       id: crypto.randomUUID(),
       domainToken: token,
       encDomain, encUsername, encPassword, encNote, encFullUrl, encGroup,
+      bastion: !!bastion, // 堡垒机目标机凭据：不在密码库列表显示
       createdAt: now, updatedAt: now,
     });
   }
@@ -370,7 +373,7 @@ async function saveCredential({ domain, username, password, note, fullUrl, group
 }
 
 // 编辑条目的备注 / 完整URL / 分组（按 id；传哪个改哪个）。
-async function updateEntry({ id, note, fullUrl, group }) {
+async function updateEntry({ id, note, fullUrl, group, password }) {
   const entries = await getEntries();
   const e = entries.find((x) => x.id === id);
   if (!e) return { ok: false, error: t("err_entry_not_found") };
@@ -378,6 +381,7 @@ async function updateEntry({ id, note, fullUrl, group }) {
   if (note !== undefined) e.encNote = note && note.trim() ? await encryptText(publicKey, note) : null;
   if (fullUrl !== undefined) e.encFullUrl = fullUrl && fullUrl.trim() ? await encryptText(publicKey, fullUrl) : null;
   if (group !== undefined) e.encGroup = group && group.trim() ? await encryptText(publicKey, group) : null;
+  if (password !== undefined) e.encPassword = password && password.trim() ? await encryptText(publicKey, password) : null;
   e.updatedAt = Date.now();
   await setEntries(entries);
   return { ok: true };
@@ -444,7 +448,7 @@ async function listAll(_payload, { privateKey }) {
     } catch {
       /* ignore */
     }
-    out.push({ id: e.id, domain, username, note, fullUrl, group, hasPassword: !!e.encPassword, updatedAt: e.updatedAt });
+    out.push({ id: e.id, domain, username, note, fullUrl, group, bastion: !!e.bastion, hasPassword: !!e.encPassword, updatedAt: e.updatedAt });
   }
   out.sort((a, b) => a.domain.localeCompare(b.domain) || a.username.localeCompare(b.username));
   return { ok: true, entries: out };
@@ -489,9 +493,21 @@ async function exportBackup() {
   const session = await getSession();
   if (!session || !session.mk) return { ok: false, locked: true, error: t("err_locked") };
 
-  const entries = await getEntries();
+  // 凭据 + 全部配置（堡垒机/分组/环境/覆盖/设置）一并打包，整体再用主密钥加密。
+  const cfg = await chrome.storage.local.get([
+    STORAGE.ENTRIES, STORAGE.GROUPS, STORAGE.ENV, STORAGE.OVERRIDES, STORAGE.BASTIONS, STORAGE.SETTINGS,
+  ]);
+  const payload = {
+    auth,
+    entries: cfg[STORAGE.ENTRIES] || [],
+    groups: cfg[STORAGE.GROUPS] || {},
+    env: cfg[STORAGE.ENV] || {},
+    overrides: cfg[STORAGE.OVERRIDES] || {},
+    bastions: cfg[STORAGE.BASTIONS] || [],
+    settings: cfg[STORAGE.SETTINGS] || {},
+  };
   const masterKey = await importAesKeyRaw(new Uint8Array(session.mk));
-  const { iv, ct } = await aesEncrypt(masterKey, JSON.stringify({ auth, entries }));
+  const { iv, ct } = await aesEncrypt(masterKey, JSON.stringify(payload));
   return { ok: true, backup: { version: 3, salt: auth.salt, kdf: auth.kdf, iv, ct } };
 }
 
@@ -511,6 +527,7 @@ async function importBackup({ backup, password }) {
     if (!payload || !payload.auth) return { ok: false, error: t("err_backup_invalid") };
     await setAuth(payload.auth);
     await setEntries(payload.entries || []);
+    await restoreConfig(payload);
     await clearSession();
     return { ok: true };
   }
@@ -519,8 +536,21 @@ async function importBackup({ backup, password }) {
   if (!backup.auth) return { ok: false, error: t("err_backup_invalid") };
   await setAuth(backup.auth);
   await setEntries(backup.entries || []);
+  await restoreConfig(backup);
   await clearSession();
   return { ok: true };
+}
+
+// 从备份还原配置（堡垒机/分组/环境/覆盖/设置）；旧备份缺这些字段则跳过，保持现状。
+async function restoreConfig(p) {
+  const set = {};
+  if (p.groups) set[STORAGE.GROUPS] = p.groups;
+  if (p.env) set[STORAGE.ENV] = p.env;
+  if (p.overrides) set[STORAGE.OVERRIDES] = p.overrides;
+  if (p.bastions) set[STORAGE.BASTIONS] = p.bastions;
+  if (p.settings) set[STORAGE.SETTINGS] = p.settings;
+  if (Object.keys(set).length) await chrome.storage.local.set(set);
+  await syncEnvCS(); // 恢复了 ep_env 后重新注册环境警告脚本
 }
 
 // 跨导航待保存：内容脚本在提交/离开页面时暂存，目标页加载后取回再提示保存。
@@ -541,6 +571,99 @@ async function getPending({ domain }) {
 async function clearPending() {
   await chrome.storage.session.remove(PENDING);
   return { ok: true };
+}
+
+// ---------- 保存提示：用系统通知（不依附网页，扛得住整页刷新/跳转）----------
+const NOTIF_ID = "ep-save";
+const NOTIFY = "ep_notify"; // 通知待保存的凭据（内存，供按钮回调读取）
+
+// 工具栏图标角标：有待保存时显示，提示用户点图标在弹窗里确认。
+function setBadge(on) {
+  try {
+    chrome.action.setBadgeText({ text: on ? "1" : "" });
+    if (on) chrome.action.setBadgeBackgroundColor({ color: "#4f46e5" });
+  } catch {
+    /* ignore */
+  }
+}
+async function getNotify() {
+  const d = await chrome.storage.session.get(NOTIFY);
+  return { ok: true, notify: d[NOTIFY] || null };
+}
+async function clearNotify() {
+  await chrome.storage.session.remove(NOTIFY);
+  setBadge(false);
+  try {
+    await chrome.notifications.clear(NOTIF_ID);
+  } catch {
+    /* ignore */
+  }
+  await clearPending();
+  return { ok: true };
+}
+
+// 内容脚本判定"该提示保存"后调用：检查解锁/去重，然后弹系统通知（带 保存/忽略）。
+async function promptSave({ domain, username, password, fullUrl }) {
+  domain = normalizeDomain(domain);
+  username = (username || "").trim();
+  if (!domain || !username) return { ok: false };
+  const session = await getSession();
+  if (!session) return { ok: true, locked: true }; // 锁定：不弹（无法加密保存）
+
+  try {
+    const ctx = {
+      privateKey: await importPrivateKey(session.privateJwk),
+      hmacKey: await importHmacKey(session.domainKey),
+    };
+    const existing = await getPassword({ domain, username }, ctx);
+    if (password) {
+      if (existing.ok && existing.password === password) return { ok: true, dup: true }; // 已存且相同
+    } else if (existing.exists) {
+      return { ok: true, dup: true }; // 仅账号且已记录
+    }
+  } catch {
+    /* 解密异常时仍照常提示 */
+  }
+
+  await chrome.storage.session.set({ [NOTIFY]: { domain, username, password: password || "", fullUrl: fullUrl || "" } });
+  setBadge(true); // 角标提示：可点工具栏图标在弹窗里确认
+  try {
+    await chrome.notifications.create(NOTIF_ID, {
+      type: "basic",
+      iconUrl: chrome.runtime.getURL("icons/icon128.png"),
+      title: t("banner_save_title"),
+      message: password ? t("banner_save_msg", [username]) : t("banner_save_account_msg", [username]),
+      contextMessage: domain,
+      buttons: [{ title: t("btn_save") }, { title: t("btn_ignore") }],
+      requireInteraction: true, // 不自动消失，直到用户处理
+      priority: 2,
+    });
+  } catch {
+    /* 通知不可用（被系统/用户关闭）时忽略 */
+  }
+  return { ok: true };
+}
+
+// 通知按钮/点击的处理：idx=0 或点通知主体 → 保存；其余 → 忽略。
+async function notifyAct(idx) {
+  const d = await chrome.storage.session.get(NOTIFY);
+  const p = d[NOTIFY];
+  await chrome.storage.session.remove(NOTIFY);
+  setBadge(false);
+  try {
+    await chrome.notifications.clear(NOTIF_ID);
+  } catch {
+    /* ignore */
+  }
+  if (idx !== 0 || !p) return;
+  const session = await getSession();
+  if (!session) return;
+  const ctx = {
+    privateKey: await importPrivateKey(session.privateJwk),
+    hmacKey: await importHmacKey(session.domainKey),
+  };
+  await saveCredential({ domain: p.domain, username: p.username, password: p.password, fullUrl: p.fullUrl }, ctx);
+  await clearPending();
 }
 
 // ---------- 分组注册表（组名 → 颜色） ----------
@@ -593,6 +716,16 @@ async function syncEnvCS() {
 async function getOverrides() {
   const d = await chrome.storage.local.get(STORAGE.OVERRIDES);
   return { ok: true, overrides: d[STORAGE.OVERRIDES] || {} };
+}
+
+// 堡垒机地址列表（明文，供堡垒机 Tab 与环境警告判断）。
+async function getBastions() {
+  const d = await chrome.storage.local.get(STORAGE.BASTIONS);
+  return { ok: true, bastions: d[STORAGE.BASTIONS] || [] };
+}
+async function setBastions({ bastions }) {
+  await chrome.storage.local.set({ [STORAGE.BASTIONS]: Array.isArray(bastions) ? bastions : [] });
+  return { ok: true };
 }
 
 // 标记某 host:端口 颜色。
@@ -725,11 +858,16 @@ const OPEN = {
   STASH_PENDING: stashPending,
   GET_PENDING: getPending,
   CLEAR_PENDING: clearPending,
+  PROMPT_SAVE: promptSave,
+  GET_NOTIFY: getNotify,
+  CLEAR_NOTIFY: clearNotify,
   SYNC_CS: syncAndInject,
   GET_GROUPS: getGroups,
   SET_GROUP_COLOR: setGroupColor,
   ARM_ENV: armEnv,
   GET_OVERRIDES: getOverrides,
+  GET_BASTIONS: getBastions,
+  SET_BASTIONS: setBastions,
 };
 
 async function route(msg) {
@@ -766,6 +904,14 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === "ep-lock") clearSession();
+});
+
+// 保存通知的「保存/忽略」按钮 + 点击通知主体（= 保存）。
+chrome.notifications.onButtonClicked.addListener((id, idx) => {
+  if (id === NOTIF_ID) notifyAct(idx);
+});
+chrome.notifications.onClicked.addListener((id) => {
+  if (id === NOTIF_ID) notifyAct(0);
 });
 
 // 启动/安装时按当前授权状态恢复内容脚本 + 环境警告脚本；授权变化时同步注册/撤销。

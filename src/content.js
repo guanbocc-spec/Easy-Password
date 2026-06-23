@@ -54,6 +54,9 @@
     username: /user(name)?|account|login|email|e-mail|phone|mobile|\btel\b|用户名|用户|账号|帐号|账户|登录名|邮箱|手机号?|电话/i,
     // 排除：搜索、验证码、找回等非账号/非密码
     negAccount: /search|搜索|query|captcha|verif|\bcode\b|otp|短信|验证码/i,
+    // 二次验证/动态码：登录页常与密码框并存，但绝不是密码（不可生成、不可回填、不计入"两个密码框"）。
+    // 注意只命中"验证码/动态码/短信"等，不误伤"确认密码/登录密码/新密码"。
+    otp: /验证码|动态(口令|密码|码|验证)|短信|二次验证|双因素|双因子|谷歌验证|安全码|令牌|2fa|otp|one[\s._-]*time[\s._-]*(code|pass)|two[\s._-]*factor|authenticator|verif\w*[\s._-]*code|sms[\s._-]*code|token/i,
   };
 
   // 收集字段的「可读文本」：关联 label、aria-label/labelledby、placeholder + 命名/类名。
@@ -85,12 +88,22 @@
     ).slice(0, 400).toLowerCase();
   }
 
+  // 是否「二次验证/动态码」字段：autocomplete=one-time-code 权威，或字段文本命中 otp 词表。
+  function isOtpField(el) {
+    if (!el || el.tagName !== "INPUT") return false;
+    const ac = (el.autocomplete || "").toLowerCase();
+    if (ac.includes("one-time-code")) return true;
+    return RE.otp.test(fieldText(el));
+  }
+
   // 判断是否「密码框」：原生 type=password，或自定义密码框（autocomplete 或字段文本命中）。
+  // 二次验证/动态码框一律排除——它不是密码，既不生成、不回填，也不计入"两个密码框"。
   function isPasswordLike(el) {
     if (!el || el.tagName !== "INPUT") return false;
     const type = (el.type || "").toLowerCase();
-    if (type === "password") return true;
+    if (type === "password") return !isOtpField(el);
     if (type && type !== "text") return false; // email/tel/number 等不算密码
+    if (isOtpField(el)) return false; // 自定义文本框若是动态码/验证码，同样排除
     const ac = (el.autocomplete || "").toLowerCase();
     if (ac.includes("current-password") || ac.includes("new-password")) return true;
     return RE.passlike.test(fieldText(el));
@@ -354,35 +367,18 @@
 
   // 真正决定「要不要弹保存」：检查锁定 / 是否已存 / 去重，再弹卡片。密码可为空（仅记账号）。
   // domain 默认当前页，但跨导航时用「捕获时的域名」，避免登录后跳转把端口丢了。
+  // 交给后台用「系统通知」提示保存（不依附网页，整页刷新/跳转都打不断）。
+  // 解锁判断、去重都在后台做；这里只在锁定时给个页内提示。
   async function maybeSave(username, password, domain, fullUrl) {
     username = (username || "").trim();
-    password = password || "";
-    domain = domain || DOMAIN;
     if (!username) return;
-    const sig = capSig(domain, username, password);
-    if (sig === lastSaved) return;
-
-    const st = await send("GET_AUTH_STATE");
-    if (!st || !st.configured) return;
-    if (!st.unlocked) {
-      showUnlockBanner(i18n("banner_locked_save_hint"));
-      return;
-    }
-    const existing = await send("GET_PASSWORD", { domain, username });
-    if (password) {
-      // 有密码：已存且相同则跳过
-      if (existing && existing.ok && existing.password === password) {
-        lastSaved = sig;
-        return;
-      }
-    } else {
-      // 仅账号：该账号已记录（无论有无密码）就不再打扰
-      if (existing && existing.exists) {
-        lastSaved = sig;
-        return;
-      }
-    }
-    showSaveBanner(username, password, sig, domain, fullUrl);
+    const r = await send("PROMPT_SAVE", {
+      domain: domain || DOMAIN,
+      username,
+      password: password || "",
+      fullUrl: fullUrl || "",
+    });
+    if (r && r.locked) showUnlockBanner(i18n("banner_locked_save_hint"));
   }
 
   // 当前一次登录的快照：优先「账号+密码」；无密码框时退而取「已填的登录账号」（手机/邮箱）。
@@ -420,8 +416,15 @@
       if (settled) return;
       settled = true;
       cleanup();
-      send("CLEAR_PENDING", { domain: cap.domain }); // 同页已定论，跨页 pending 不再需要
-      if (success) maybeSave(cap.username, cap.password, cap.domain, cap.fullUrl);
+      if (success) {
+        // 同页(SPA)立即提示；并【保留】pending —— 若紧接着整页刷新/跳转，
+        // 目标页 checkPendingSave 会再提示一次，避免"刷新太快没机会点保存"。
+        // 去重逻辑(lastSaved/已存)保证不会重复弹。
+        maybeSave(cap.username, cap.password, cap.domain, cap.fullUrl);
+      } else {
+        // 大概率登录失败：丢弃 pending，避免日后误存错密码。
+        send("CLEAR_PENDING", { domain: cap.domain });
+      }
     };
     const gone = () => !document.contains(cap.anchor) || !isVisible(cap.anchor) || location.href !== startURL;
     const obs = new MutationObserver(() => { if (gone()) finish(true); });
@@ -485,26 +488,6 @@
     banner.appendChild(actions);
     document.documentElement.appendChild(banner);
     return banner;
-  }
-
-  function showSaveBanner(username, password, sig, domain, fullUrl) {
-    domain = domain || DOMAIN;
-    const accountOnly = !password;
-    const message = accountOnly ? i18n("banner_save_account_msg", [username]) : i18n("banner_save_msg", [username]);
-    const saveLabel = accountOnly ? i18n("btn_remember") : i18n("btn_save");
-    const banner = buildBanner(i18n("banner_save_title"), message, [
-      {
-        label: saveLabel,
-        primary: true,
-        onClick: async (b) => {
-          await send("SAVE_CREDENTIAL", { domain, username, password, fullUrl: fullUrl || location.href });
-          lastSaved = sig;
-          b.remove();
-        },
-      },
-      { label: i18n("btn_ignore"), onClick: (b) => { lastSaved = sig; b.remove(); } },
-    ]);
-    setTimeout(() => banner.remove(), 15000);
   }
 
   let unlockBannerShownAt = 0;

@@ -47,6 +47,19 @@
 
     <!-- 视图 3：主界面（已解锁） -->
     <section id="viewMain" class="view" hidden>
+      <!-- 待保存提示（图标角标点开后在此确认） -->
+      <div id="saveBar" class="save-bar" hidden>
+        <span id="saveBarText" class="save-bar-text"></span>
+        <button id="saveBarSave" class="btn small" data-i18n="btn_save">保存</button>
+        <button id="saveBarIgnore" class="btn small" data-i18n="btn_ignore">忽略</button>
+      </div>
+
+      <div class="tabbar">
+        <button id="tabVault" class="tab active" data-i18n="tab_vault">密码库</button>
+        <button id="tabBastion" class="tab" data-i18n="tab_bastion">堡垒机</button>
+      </div>
+
+      <div id="vaultPanel">
       <button id="addToggle" class="btn small add-toggle">＋ <span data-i18n="btn_toggle_add">新增账号</span></button>
       <div class="add" id="addSection" hidden>
         <div class="row">
@@ -101,8 +114,26 @@
         </div>
 
         <button id="clearBrowserPM" class="btn small danger-btn" data-i18n="btn_disable_browser_pm">清除并禁用浏览器自带密码</button>
+      </div>
+      </div><!-- /vaultPanel -->
 
-        <div class="set-row set-divider">
+      <!-- 堡垒机记录器：从堡垒机 URL 识别目标机 IP+用户，过滤/新增该目标机凭据（无法回填，提供复制） -->
+      <div id="bastionPanel" hidden>
+        <div id="bastionContext"></div>
+        <div class="bastion-hosts">
+          <div class="set-row"><span data-i18n="bastion_hosts_title">堡垒机地址（可多个）</span></div>
+          <div id="bastionList" class="override-list"></div>
+          <div class="override-input">
+            <input id="bastionHostInput" type="text" data-i18n-ph="ph_bastion_host" />
+            <button id="bastionAddBtn" class="btn small" data-i18n="bastion_add">添加</button>
+          </div>
+          <button id="bastionSetCurrent" class="btn small" data-i18n="bastion_set_current">把当前站点设为堡垒机</button>
+        </div>
+      </div>
+
+      <!-- 两个 Tab 共用：自动锁定 / 活动续期 / 备份 / 改主密码 -->
+      <div class="common">
+        <div class="set-row">
           <span data-i18n="setting_autolock">自动锁定</span>
           <select id="lockMinutes">
             <option value="5" data-i18n="opt_5min">5 分钟</option>
@@ -117,14 +148,13 @@
           <input id="sliding" type="checkbox" />
         </label>
         <div class="set-kdf" id="kdfInfo"></div>
+        <footer class="footer">
+          <button id="exportBtn" class="btn small" data-i18n="export_btn">导出加密备份</button>
+          <button id="importBtn" class="btn small" data-i18n="import_btn">导入备份</button>
+          <button id="pwdBtn" class="btn small" data-i18n="pwd_btn">改主密码</button>
+          <input id="importFile" type="file" accept="application/json" hidden />
+        </footer>
       </div>
-
-      <footer class="footer">
-        <button id="exportBtn" class="btn small" data-i18n="export_btn">导出加密备份</button>
-        <button id="importBtn" class="btn small" data-i18n="import_btn">导入备份</button>
-        <button id="pwdBtn" class="btn small" data-i18n="pwd_btn">改主密码</button>
-        <input id="importFile" type="file" accept="application/json" hidden />
-      </footer>
     </section>
 
     <!-- 视图 5：创建主账户后引导授权网站访问 -->
